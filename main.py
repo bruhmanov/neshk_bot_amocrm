@@ -1,11 +1,10 @@
-from dotenv import load_dotenv
-import os
 import telebot
 from telebot import types
-import requests
-import json
-import time
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 import logging
+import config
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,99 +14,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+bot = telebot.TeleBot(config.TELEGRAM_BOT_TOKEN)
 
-AMOCRM_DOMAIN = os.getenv('AMOCRM_DOMAIN')
-CLIENT_ID = os.getenv('CLIENT_ID')
-CLIENT_SECRET = os.getenv('CLIENT_SECRET')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-REDIRECT_URI = os.getenv('REDIRECT_URI', 'https://ya.ru')
+def authorize_google_sheets():
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(config.GOOGLE_SHEETS_CREDENTIALS, scope)
+    client = gspread.authorize(creds)
+    return client
 
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-
-def load_tokens():
+def add_data_to_google_sheets(name, phone, age, username):
     try:
-        with open('tokens.json', 'r') as file:
-            return json.load(file)
-    except FileNotFoundError:
-        return None
+        client = authorize_google_sheets()
+        sheet = client.open(config.GOOGLE_SHEETS_NAME).worksheet("Лист1")
 
-def save_tokens(tokens):
-    with open('tokens.json', 'w') as file:
-        json.dump(tokens, file)
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-def refresh_tokens():
-    tokens = load_tokens()
-    if not tokens:
-        raise Exception("Токены не найдены. Необходима повторная авторизация.")
+        age_with_years = f"{age} лет"
 
-    url = f'https://{AMOCRM_DOMAIN}/oauth2/access_token'
-    data = {
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-        'grant_type': 'refresh_token',
-        'refresh_token': tokens['refresh_token'],
-        'redirect_uri': REDIRECT_URI
-    }
-    response = requests.post(url, data=data)
-    if response.status_code == 200:
-        new_tokens = response.json()
-        new_tokens['expires_in'] = time.time() + new_tokens['expires_in']
-        save_tokens(new_tokens)
-        logger.info("Токены успешно обновлены!")
-        return new_tokens
-    else:
-        logger.error(f"Ошибка при обновлении токенов: {response.status_code}, {response.text}")
-        raise Exception("Ошибка при обновлении токенов.")
+        if username.startswith("@"):
+            username = username[1:]
 
-def get_access_token():
-    tokens = load_tokens()
-    if not tokens:
-        raise Exception("Токены не найдены. Необходима повторная авторизация.")
+        if phone.startswith("+"):
+            phone = phone[1:]
 
-    if time.time() >= tokens['expires_in']:
-        logger.info("Токен истек. Обновление...")
-        tokens = refresh_tokens()
+        response = sheet.append_row([current_time, name, username, phone, age_with_years])
 
-    return tokens['access_token']
+        logger.info(f"Ответ от Google Sheets API: {response}")
 
-def add_lead_to_amo_crm(name, phone, age, username):
-    access_token = get_access_token()
+        if response:
+            logger.info(f"Данные успешно добавлены в Google Sheets: {current_time}, {name}, {username}, {phone}, {age_with_years}")
+            return True
+        else:
+            logger.error("Ошибка: Пустой ответ от Google Sheets API")
+            return False
 
-    url = f'https://{AMOCRM_DOMAIN}/api/v4/leads'
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json'
-    }
-    data = [
-        {
-            "name": f"Лид от {name}",
-            "custom_fields_values": [
-                {
-                    "field_id": 931725,
-                    "values": [{"value": phone}]
-                },
-                {
-                    "field_id": 931775,
-                    "values": [{"value": age}]
-                },
-                {
-                    "field_id": 932703,
-                    "values": [{"value": username}]
-                }
-            ]
-        }
-    ]
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(data))
-        response.raise_for_status()
-        logger.info(f"Лид успешно создан! ID лида: {response.json()['_embedded']['leads'][0]['id']}")
-        return True
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Ошибка при создании лида: {e}")
+    except gspread.exceptions.APIError as e:
+        logger.error(f"Ошибка при добавлении данных в Google Sheets: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка: {e}")
         return False
 
-# Обработчик команды /start
 @bot.message_handler(commands=['start'])
 def main(message):
     file_id = 'AgACAgIAAxkDAAMiZ7hmP7jMxCSWyPuPNUru_PXsmWkAAtHrMRtJ8cBJFJx_lD_HfxABAAMCAAN5AAM2BA'
@@ -132,7 +79,6 @@ def main(message):
     )
     bot.send_message(message.chat.id, response, parse_mode='html', reply_markup=markup)
 
-# Обработчик выбора возраста
 @bot.callback_query_handler(func=lambda call: True)
 def handle_age(call):
     age = call.data
@@ -152,33 +98,42 @@ def handle_age(call):
 
     bot.register_next_step_handler(call.message, get_phone, age)
 
-# Обработчик отправки номера телефона
-@bot.message_handler(content_types=['contact'])
 def get_phone(message, age):
-    phone_number = message.contact.phone_number
+    phone_number = None
 
-    # Получаем ник пользователя
+    if message.contact:
+        phone_number = message.contact.phone_number
+    elif message.text:
+        phone_number = message.text
+
+    if not phone_number:
+        bot.send_message(
+            message.chat.id,
+            "Пожалуйста, укажите номер телефона.",
+            reply_markup=types.ReplyKeyboardRemove(selective=False)
+        )
+        bot.register_next_step_handler(message, get_phone, age)
+        return
+
     username = message.from_user.username
     if username:
-        username = f"@{username}"
+        username = username
     else:
         username = "Не указан"
 
-    markup = types.ReplyKeyboardRemove(selective=False)
-
-    if add_lead_to_amo_crm(message.from_user.first_name, phone_number, age, username):
+    if add_data_to_google_sheets(message.from_user.first_name, phone_number, age, username):
         bot.send_message(
             message.chat.id,
             "Спасибо!\n\n"
             "Скоро наш администратор свяжется с вами и согласует дату и время мастер-класса!\n\n"
             "Подпишитесь на наш канал в Telegram, чтобы быть в курсе акций и новых предложений: https://t.me/neshkolakidskzn",
-            reply_markup=markup
+            reply_markup=types.ReplyKeyboardRemove(selective=False)
         )
     else:
         bot.send_message(
             message.chat.id,
             "Произошла ошибка при обработке вашей заявки. Пожалуйста, попробуйте позже.",
-            reply_markup=markup
+            reply_markup=types.ReplyKeyboardRemove(selective=False)
         )
 
 if __name__ == "__main__":
